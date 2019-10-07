@@ -61,7 +61,7 @@ a custom protocol.
 
 The interface to the CLI is the same as in the [previous project]. The
 difference this time is in the concurrent implementation, which will be
-described as we work through it..
+described as we work through it.
 
 [previous project]: ../project-3/project.md
 
@@ -100,7 +100,7 @@ This project should not require any changes at all to the client code.
 
 ## Project setup
 
-Continuing from your previous project, delete your privous `tests` directory and
+Continuing from your previous project, delete your previous `tests` directory and
 copy this project's `tests` directory into its place. This project should
 contain a library named `kvs`, and two executables, `kvs-server` and
 `kvs-client`.
@@ -116,6 +116,7 @@ predicates = "1.0.0"
 rand = "0.6.5"
 tempfile = "3.0.7"
 walkdir = "2.2.7"
+panic-control = "0.1.4"
 ```
 
 As with previous projects, add enough definitions that the test suite builds.
@@ -627,8 +628,7 @@ Call this benchmark `read_queued_kvstore` (or whatever).
 
 **Whew. That was a lot of work**.
 
-So you can run this set of criterion benchmarks as usual with `cargo bench
---release`.
+So you can run this set of criterion benchmarks as usual with `cargo bench`.
 
 <!-- TODO show example results -->
 
@@ -1156,7 +1156,7 @@ Like cloning, garbage collection is often frowned upon in Rust &mdash; avoiding
 GC is almost the entire reason Rust exists. But it's no secret that, actually,
 garbage collection can't be avoided, "garbage collection" and "memory
 reclaimation" are practically synonymous, and every language uses a mixture of
-garbage collection strategies. One one end of the GC spectrum, in languages with
+garbage collection strategies. On one end of the GC spectrum, in languages with
 no automatic memory management, like C, the garbage collection is left entirely
 up to the programmer, e.g. via `malloc` and `free`. On the other end are garbage
 collected languages, like Java, where all memory is collected by a single
@@ -1248,7 +1248,7 @@ type as you can_.
 
 There are no new test cases to complete here, but some of the earlier ones will
 stress this new data structure in challenging ways, your previously-written
-benchmamrks will stress this implementation hard.
+benchmarks will stress this implementation hard.
 
 
 ## Part 9: Benchmarking lock-free data structures

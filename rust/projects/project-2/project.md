@@ -314,7 +314,7 @@ Some of the APIs you will call may fail, and return a `Result` of some error typ
 Make sure that your calling functions return a `Result` of _your own_ error type,
 and that you convert between the two with `?`.
 
-It is similar to implement the "rm" command, but you should additionally
+It is similar to implementing the "rm" command, but you should additionally
 check if the key exists before writing the command to the log. As we have two
 different commands that must be distinguished, you may use variants of a single
 enum type to represent each command. `serde` just works perfectly with enums.
@@ -322,7 +322,7 @@ enum type to represent each command. `serde` just works perfectly with enums.
 You may implement the "set" and "rm" commands now, focusing on the `set` / `rm`
 test cases, or you can proceed to the next section to read about the "get"
 command. It may help to keep both in mind, or to implement them both
-simultaniously. It is your choice.
+simultaneously. It is your choice.
 
 
 ## Part 4: Reading from the log
