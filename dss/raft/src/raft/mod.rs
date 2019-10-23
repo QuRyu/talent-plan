@@ -1,5 +1,5 @@
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::sync::mpsc::UnboundedSender;
 use labrpc::RpcFuture;
@@ -49,8 +49,14 @@ pub struct Raft {
     me: usize,
     state: Arc<State>,
     // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
+
+    // state maintained for a raft peer 
+    votedFor: Option<usize>,
+    commit_index: u64, // index of highest entries committed
+    last_applied: u64, // index of highest entries applied to state machine
+}
+
+pub struct Log {
 }
 
 impl Raft {
@@ -76,6 +82,9 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
+            votedFor: None,
+            commit_index: 0, 
+            last_applied: 0,
         };
 
         // initialize from state persisted before a crash
@@ -204,14 +213,15 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
+    raft: Arc<Mutex<Raft>>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        // Your code here.
-        crate::your_code_here(raft)
+        Node { 
+            raft: Arc::new(Mutex::new(raft))
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -230,26 +240,19 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
+        let raft = self.raft.lock().unwrap();
+        raft.state.term()
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        let raft = self.raft.lock().unwrap();
+        raft.state.is_leader()
     }
 
     /// The current state of this peer.
@@ -258,6 +261,17 @@ impl Node {
             term: self.term(),
             is_leader: self.is_leader(),
         }
+    }
+
+    fn commit_index(&self) -> u64 {
+        let raft = self.raft.lock().unwrap();
+        raft.commit_index
+    }
+
+    fn voted_for(&self) -> Option<usize> {
+        let raft = self.raft.lock().unwrap();
+        raft.votedFor.clone()
+
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -279,6 +293,22 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        // RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm} 
+
+        let reply = |granted| { Box::new(futures::future::ok(RequestVoteReply {
+            term: self.term(), 
+            vote_granted: granted,
+        }))};
+
+        if self.term() > args.term {
+            reply(false)
+        } else if (self.voted_for().is_none() ||
+                   self.voted_for().unwrap() as u64 == args.candidate_id) 
+            && self.commit_index() <= args.last_log_index {
+            reply(true)
+        } else {
+            reply(false)
+        }
+        
     }
 }
