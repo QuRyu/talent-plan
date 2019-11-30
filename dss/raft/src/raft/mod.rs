@@ -1,7 +1,11 @@
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::{Arc, Mutex};
-
+use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
+use std::thread;
+use std::time::{Instant, Duration};
 use futures::sync::mpsc::UnboundedSender;
+use futures::{Future, future};
+use threadpool::ThreadPool; 
+use rand::Rng;
 use labrpc::RpcFuture;
 
 #[cfg(test)]
@@ -14,6 +18,11 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+
+const ELECTION_TIMEOUT_LOWER_BOUND: usize = 300;
+const ELECTION_TIMEOUT_UPPER_BOUND: usize = 500;
+const HEART_BEAT_INTERVAL: u32 = 200;
+const MILLIS: Duration = Duration::from_millis(1);
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -47,16 +56,16 @@ pub struct Raft {
     persister: Box<dyn Persister>,
     // this peer's index into peers[]
     me: usize,
-    state: Arc<State>,
-    // Your data here (2A, 2B, 2C).
+    //state: Arc<State>,
+    term: u64, 
+    is_leader: bool,
 
-    // state maintained for a raft peer 
-    votedFor: Option<usize>,
+    // state maintained for a raft peer
+    voted_for: (u64, usize), // (current_term, leader_id)
     commit_index: u64, // index of highest entries committed
     last_applied: u64, // index of highest entries applied to state machine
-}
 
-pub struct Log {
+    timer: Instant, // timer to keep track when the last communication happened 
 }
 
 impl Raft {
@@ -72,7 +81,7 @@ impl Raft {
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
-        apply_ch: UnboundedSender<ApplyMsg>,
+        _apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
 
@@ -81,16 +90,19 @@ impl Raft {
             peers,
             persister,
             me,
-            state: Arc::default(),
-            votedFor: None,
-            commit_index: 0, 
+            //state: Arc::default(),
+            term: 0, 
+            is_leader: false, 
+            voted_for: (0, 0),
+            commit_index: 0,
             last_applied: 0,
+            timer: Instant::now(),
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf 
     }
 
     /// save Raft's persistent state to stable storage,
@@ -144,24 +156,18 @@ impl Raft {
         &self,
         server: usize,
         args: &RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+    ) -> mpsc::Receiver<Result<RequestVoteReply>> {
+        let peer = &self.peers[server];
+        let (tx, rx) = mpsc::sync_channel::<Result<RequestVoteReply>>(1);
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    tx.send(res).unwrap();
+                    Ok(())
+                }),
+        );
+        rx
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -181,6 +187,31 @@ impl Raft {
             Err(Error::NotLeader)
         }
     }
+
+    fn update_timer(&mut self) {
+        self.timer = Instant::now();
+    }
+
+    fn increment_term(&mut self) {
+        self.term += 1;
+    }
+
+    fn term(&self) -> u64 {
+        self.term 
+    }
+
+    // TODO: change this for 2C
+    fn last_log_index(&self) -> u64 {
+        self.commit_index
+    }
+
+    // TODO: change this for 2C
+    fn last_log_term(&self) -> u64 {
+        self.term 
+    }
+
+
+
 }
 
 impl Raft {
@@ -190,10 +221,11 @@ impl Raft {
         let _ = self.start(&0);
         let _ = self.send_request_vote(0, &Default::default());
         self.persist();
-        let _ = &self.state;
+        //let _ = &self.state;
         let _ = &self.me;
         let _ = &self.persister;
         let _ = &self.peers;
+        let _ = &self.last_applied;
     }
 }
 
@@ -219,9 +251,202 @@ pub struct Node {
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        Node { 
-            raft: Arc::new(Mutex::new(raft))
+        let node = Node {
+            raft: Arc::new(Mutex::new(raft)),
+        };
+
+        let raft = node.raft.lock().expect("raft unlock failed");
+        let me = raft.me;
+        std::mem::drop(raft);
+
+        let node_share = node.clone();
+        let election_thread = 
+            thread::Builder::new().name(format!("election thread for peer {}", me));
+        election_thread.spawn(move || {
+            node_share.election()
+        }).expect("election thread failed to spawn");
+
+
+        let node_share = node.clone();
+        let heartbeat_thread = 
+            thread::Builder::new().name(format!("heartbeat thread for peer {}", me));
+        heartbeat_thread.spawn(move || {
+            node_share.heartbeat()
+        }).expect("heartbeat thread failed to spawn");
+
+        node 
+    }
+
+    // manage election  
+    fn election(&self) { 
+        let mut rng = rand::thread_rng();
+        let mut timeout_gen = move || -> Duration {
+            MILLIS * rng.gen_range(ELECTION_TIMEOUT_LOWER_BOUND, 
+                          ELECTION_TIMEOUT_UPPER_BOUND) as u32
+        };
+
+        let raft = self.raft.lock().unwrap();
+        let peer_count = raft.peers.len(); // #peers 
+        let votes_needed = peer_count / 2; 
+        let me = raft.me; // id of current server 
+        std::mem::drop(raft);
+
+        let mut election_timeout = timeout_gen();
+        loop {
+
+            let mut raft = self.raft.lock().unwrap();
+
+            if raft.is_leader {
+                std::mem::drop(raft);
+                thread::sleep(10 * MILLIS);
+                continue; 
+            }
+
+            // election times out, start the election 
+            if raft.timer.elapsed() >= election_timeout {
+                let vote_count = Arc::new(AtomicUsize::new(1));
+                let vote_cancelled = Arc::new(AtomicBool::new(false));
+                let highest_term = Arc::new(AtomicU64::new(raft.term));
+                let mut become_leader = false; 
+
+                election_timeout = timeout_gen();
+                raft.increment_term();
+
+                let request_vote_args = RequestVoteArgs {
+                    term: raft.term(),
+                    candidate_id: me as u64, 
+                    last_log_index: raft.last_log_index(),
+                    last_log_term: raft.last_log_term(),
+                };
+
+                let mut receivers = vec![];
+                for i in 0..peer_count {
+                    if i == me { continue; }
+
+                    if vote_cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let rx = (*raft).send_request_vote(i, &request_vote_args);
+                    receivers.push(rx);
+                }
+
+                let current = raft.timer;
+                std::mem::drop(raft);
+
+                // continue to poll responses while election has not timed out 
+                while current.elapsed() < election_timeout && !vote_cancelled.load(Ordering::SeqCst) { 
+                    for (i, rx) in receivers.iter().enumerate() {
+                        match rx.try_recv() {
+                            Ok(res) => {
+                                match res {
+                                    Ok(res) => {
+                                        if !res.vote_granted { 
+                                            highest_term.store(res.term, Ordering::SeqCst);
+                                            vote_cancelled.store(false, Ordering::SeqCst);
+                                        } else {
+                                            vote_count.fetch_add(1, Ordering::SeqCst); 
+                                        }
+                                    }
+                                    Err(e) => error!("send request vote from server {} to server {}: {:?}", me, i, e),
+                                }
+                            }
+                            Err(_) => {} 
+                        }
+                    }
+
+
+                    if !vote_cancelled.load(Ordering::SeqCst) && vote_count.load(Ordering::SeqCst) >= votes_needed {
+                        become_leader = true; 
+                        break; 
+                    } 
+
+                    thread::sleep(1 * MILLIS);
+                }
+
+                let mut raft = self.raft.lock().unwrap();
+                if become_leader { 
+                    // become the leader
+                    raft.is_leader = true; 
+                    raft.voted_for = (raft.term, raft.me);
+                    raft.update_timer();
+                    std::mem::drop(raft);
+
+                    // send heartbeats to all followers 
+                    // start agreement process  
+                    self.start_agreement();
+                } else { 
+                    // request rejected
+                    // update term and become follower 
+                    raft.is_leader = false;
+                    raft.term = highest_term.load(Ordering::SeqCst);
+                    raft.update_timer();
+                }
+            }
+
+            thread::sleep(1 * MILLIS);
         }
+    }
+
+    // managing heartbeats
+    // send regular heartbeats to followers to keep the lead 
+    fn heartbeat(&self) {
+        loop {
+            let mut raft = self.raft.lock().unwrap();
+
+            if raft.is_leader {
+                if raft.timer.elapsed() > MILLIS * HEART_BEAT_INTERVAL  { 
+                    raft.update_timer();
+                    std::mem::drop(raft);
+
+                    self.send_heart_beats();
+                }
+            }
+
+            thread::sleep(1 * MILLIS);
+        }
+
+    }
+
+    fn send_heart_beats(&self) {
+        let mut raft = self.raft.lock().unwrap();
+
+
+        let term = raft.term; 
+        let me = raft.me;
+
+        for i in 0..raft.peers.len() { 
+            if i == raft.me {
+                continue; 
+            }
+
+            let peer = raft.peers[i].clone();
+
+            let thread = thread::Builder::new().name(format!("sending heartbeats from {} to {}", me, i));
+            thread.spawn(move || {
+                let heart_beat_args = AppendEntriesArgs { 
+                    term: raft.term, 
+                    leader_id: raft.me as u64, 
+                    //prev_log_index: 0, // TODO: placeholder 
+                };
+
+                peer.append_entries(&heart_beat_args).and_then(|rep| {
+                    let AppendEntriesReply { term, success } = rep; 
+
+                    if term > term { 
+                        // become follower 
+                    }
+
+                    future::ok(())
+                });
+
+            });
+
+        }
+    }
+
+    fn start_agreement(&self) {
+        
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -246,13 +471,13 @@ impl Node {
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
         let raft = self.raft.lock().unwrap();
-        raft.state.term()
+        raft.term()
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
         let raft = self.raft.lock().unwrap();
-        raft.state.is_leader()
+        raft.is_leader
     }
 
     /// The current state of this peer.
@@ -268,10 +493,9 @@ impl Node {
         raft.commit_index
     }
 
-    fn voted_for(&self) -> Option<usize> {
+    fn voted_for(&self) -> usize {
         let raft = self.raft.lock().unwrap();
-        raft.votedFor.clone()
-
+        raft.voted_for.1
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -293,22 +517,35 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        // RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm} 
+        // RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm}
 
-        let reply = |granted| { Box::new(futures::future::ok(RequestVoteReply {
-            term: self.term(), 
-            vote_granted: granted,
-        }))};
+        let mut raft = self.raft.lock().unwrap();
+        raft.update_timer();
+        std::mem::drop(raft);
+
+        let reply = |granted| {
+            Box::new(futures::future::ok(RequestVoteReply {
+                term: self.term(),
+                vote_granted: granted,
+            }))
+        };
 
         if self.term() > args.term {
             reply(false)
-        } else if (self.voted_for().is_none() ||
-                   self.voted_for().unwrap() as u64 == args.candidate_id) 
-            && self.commit_index() <= args.last_log_index {
+        } else if self.voted_for() as u64 == args.candidate_id
+            && self.commit_index() <= args.last_log_index
+        {
             reply(true)
         } else {
             reply(false)
         }
-        
+    }
+
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        // TODO: this is not gonna work 
+        Box::new(futures::future::ok(AppendEntriesReply {
+            term: self.term(),
+            success: true 
+        }))
     }
 }

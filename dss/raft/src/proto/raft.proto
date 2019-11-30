@@ -17,3 +17,17 @@ message RequestVoteReply {
     fixed64 term = 1;
     bool voteGranted = 2;
 }
+
+message AppendEntriesArgs {
+    fixed64 term = 1; 
+    fixed64 leaderID = 2; 
+    /*fixed64 prevLogIndex = 3; */
+    /*fixed64 prevLogTerm = 4; */
+    /*entries; */
+    /*fixed64 leaderCommit = 6;*/
+}
+
+message AppendEntriesReply {
+    fixed64 term = 1; 
+    bool success = 2; 
+}
