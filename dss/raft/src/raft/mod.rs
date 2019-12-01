@@ -409,31 +409,35 @@ impl Node {
     }
 
     fn send_heart_beats(&self) {
-        let mut raft = self.raft.lock().unwrap();
+        let raft = self.raft.lock().unwrap();
 
-
-        let term = raft.term; 
+        let cur_term = raft.term; 
         let me = raft.me;
+        let peers_len = raft.peers.len();
 
-        for i in 0..raft.peers.len() { 
-            if i == raft.me {
+        std::mem::drop(raft);
+
+        for i in 0..peers_len { 
+            if i == me {
                 continue; 
             }
 
+            let raft = self.raft.lock().unwrap();
             let peer = raft.peers[i].clone();
+            std::mem::drop(raft);
 
             let thread = thread::Builder::new().name(format!("sending heartbeats from {} to {}", me, i));
             thread.spawn(move || {
                 let heart_beat_args = AppendEntriesArgs { 
-                    term: raft.term, 
-                    leader_id: raft.me as u64, 
+                    term: cur_term, 
+                    leader_id: me as u64, 
                     //prev_log_index: 0, // TODO: placeholder 
                 };
 
                 peer.append_entries(&heart_beat_args).and_then(|rep| {
                     let AppendEntriesReply { term, success } = rep; 
 
-                    if term > term { 
+                    if term > cur_term { 
                         // become follower 
                     }
 
