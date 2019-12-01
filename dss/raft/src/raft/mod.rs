@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use std::thread;
 use std::time::{Instant, Duration};
 use futures::sync::mpsc::UnboundedSender;
-use futures::{Future, future};
-use threadpool::ThreadPool; 
+use futures::Future;
+use futures_cpupool::CpuPool;
 use rand::Rng;
 use labrpc::RpcFuture;
 
@@ -210,6 +210,12 @@ impl Raft {
         self.term 
     }
 
+    /// Change state to follower 
+    fn become_follower(&mut self, new_term: u64) {
+        self.is_leader = false; 
+        self.term = new_term;
+        self.update_timer();
+    }
 
 
 }
@@ -246,6 +252,7 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     raft: Arc<Mutex<Raft>>,
+    worker:  CpuPool,
 }
 
 impl Node {
@@ -253,6 +260,7 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         let node = Node {
             raft: Arc::new(Mutex::new(raft)),
+            worker: CpuPool::new_num_cpus(),
         };
 
         let raft = node.raft.lock().expect("raft unlock failed");
@@ -378,9 +386,7 @@ impl Node {
                 } else { 
                     // request rejected
                     // update term and become follower 
-                    raft.is_leader = false;
-                    raft.term = highest_term.load(Ordering::SeqCst);
-                    raft.update_timer();
+                    raft.become_follower(highest_term.load(Ordering::SeqCst));
                 }
             }
 
@@ -426,25 +432,37 @@ impl Node {
             let peer = raft.peers[i].clone();
             std::mem::drop(raft);
 
-            let thread = thread::Builder::new().name(format!("sending heartbeats from {} to {}", me, i));
-            thread.spawn(move || {
+            let retry = Arc::new(AtomicBool::new(false));
+            let become_follower = Arc::new(AtomicBool::new(false));
+
+            self.worker.spawn_fn(move || -> RpcFuture<()> {
                 let heart_beat_args = AppendEntriesArgs { 
                     term: cur_term, 
                     leader_id: me as u64, 
                     //prev_log_index: 0, // TODO: placeholder 
                 };
 
-                peer.append_entries(&heart_beat_args).and_then(|rep| {
+                let retry_clone = retry.clone();
+                let become_follower_clone = become_follower.clone();
+
+
+                Box::new(peer.append_entries(&heart_beat_args).map(move |rep| {
                     let AppendEntriesReply { term, success } = rep; 
 
-                    if term > cur_term { 
-                        // become follower 
+                    if term > cur_term { // become follower 
+                        //let raft = self.raft.lock().unwrap();
+                        //(*raft).become_follower(term);
+                        become_follower_clone.store(true, Ordering::SeqCst);
+                    } else if !success { // retry 
+                        //let raft = self.raft.lock().unwrap();
+                        //raft.retry();
+                        retry_clone.store(true, Ordering::SeqCst);
+                    } else { // update pointer to follower's index
+                        
                     }
 
-                    future::ok(())
-                });
-
-            });
+                }))
+            }).forget();
 
         }
     }
@@ -452,6 +470,7 @@ impl Node {
     fn start_agreement(&self) {
         
     }
+
 
     /// the service using Raft (e.g. a k/v server) wants to start
     /// agreement on the next command to be appended to Raft's log. if this
