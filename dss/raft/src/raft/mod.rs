@@ -320,6 +320,8 @@ impl Node {
                 election_timeout = timeout_gen();
                 raft.increment_term();
 
+                info!("server {} starts election process, new term {}", me, raft.term);
+
                 let request_vote_args = RequestVoteArgs {
                     term: raft.term(),
                     candidate_id: me as u64, 
@@ -335,7 +337,7 @@ impl Node {
                         break;
                     }
 
-                    let rx = (*raft).send_request_vote(i, &request_vote_args);
+                    let rx = raft.send_request_vote(i, &request_vote_args);
                     receivers.push(rx);
                 }
 
@@ -423,6 +425,8 @@ impl Node {
 
         std::mem::drop(raft);
 
+        let highest_term = Arc::new(AtomicU64::new(cur_term));
+
         for i in 0..peers_len { 
             if i == me {
                 continue; 
@@ -432,8 +436,7 @@ impl Node {
             let peer = raft.peers[i].clone();
             std::mem::drop(raft);
 
-            let retry = Arc::new(AtomicBool::new(false));
-            let become_follower = Arc::new(AtomicBool::new(false));
+            let highest_term = highest_term.clone();
 
             self.worker.spawn_fn(move || -> RpcFuture<()> {
                 let heart_beat_args = AppendEntriesArgs { 
@@ -442,28 +445,24 @@ impl Node {
                     //prev_log_index: 0, // TODO: placeholder 
                 };
 
-                let retry_clone = retry.clone();
-                let become_follower_clone = become_follower.clone();
-
-
                 Box::new(peer.append_entries(&heart_beat_args).map(move |rep| {
                     let AppendEntriesReply { term, success } = rep; 
 
+
                     if term > cur_term { // become follower 
-                        //let raft = self.raft.lock().unwrap();
-                        //(*raft).become_follower(term);
-                        become_follower_clone.store(true, Ordering::SeqCst);
+                        highest_term.store(term, Ordering::SeqCst);
                     } else if !success { // retry 
-                        //let raft = self.raft.lock().unwrap();
-                        //raft.retry();
-                        retry_clone.store(true, Ordering::SeqCst);
                     } else { // update pointer to follower's index
-                        
                     }
 
                 }))
             }).forget();
+        }
 
+
+        if highest_term.load(Ordering::SeqCst) > cur_term { // become follower 
+            let mut raft = self.raft.lock().unwrap();
+            raft.become_follower(highest_term.load(Ordering::SeqCst));
         }
     }
 
@@ -566,8 +565,14 @@ impl RaftService for Node {
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         // TODO: this is not gonna work 
+        let mut raft = self.raft.lock().unwrap();
+        if raft.term < args.term {
+            raft.term = args.term;
+        }
+
+        raft.update_timer();
         Box::new(futures::future::ok(AppendEntriesReply {
-            term: self.term(),
+            term: raft.term,
             success: true 
         }))
     }
