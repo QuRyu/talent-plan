@@ -1,8 +1,9 @@
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
-use std::time::Instant; 
+use std::time::{Instant, Duration}; 
 
 use futures::sync::mpsc::UnboundedSender;
+use rand::Rng;
 
 use labrpc::RpcFuture;
 
@@ -16,6 +17,12 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+
+const ELECTION_TIMEOUT_LOWER_BOUND: u32 = 500;
+const ELECTION_TIMEOUT_UPPER_BOUND: u32 = 1000;
+const HEARTBEAT_TIMEOUT: u32 = 300;
+
+const MILLIS: Duration = Duration::from_millis(1);
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -75,7 +82,8 @@ pub struct Raft {
     leader_id: Option<u64>, 
     role: Role, 
     timer: Instant, 
-
+    election_timeout: Duration, 
+    heartbeat_timeout: Duration, 
 }
 
 impl Raft {
@@ -105,12 +113,18 @@ impl Raft {
             leader_id: None, 
             role: Default::default(), 
             timer: Instant::now(),
+            election_timeout: MILLIS,
+            heartbeat_timeout: HEARTBEAT_TIMEOUT * MILLIS,
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf.reset_election_timeout();
+
+        //crate::your_code_here((rf, apply_ch))
+
+        rf
     }
 
     /// save Raft's persistent state to stable storage,
@@ -200,6 +214,26 @@ impl Raft {
         } else {
             Err(Error::NotLeader)
         }
+    }
+
+    fn reset_timer(&mut self) {
+        self.timer = Instant::now();
+    }
+
+    fn reset_election_timeout(&mut self) {
+        let timeout = 
+            rand::thread_rng().gen_range(
+                ELECTION_TIMEOUT_LOWER_BOUND,
+                ELECTION_TIMEOUT_UPPER_BOUND);
+        self.election_timeout = timeout * MILLIS;
+    }
+
+    fn pass_election_timeout(&self) -> bool {
+        self.timer.elapsed() > self.election_timeout
+    }
+
+    fn pass_heartbeat_timeout(&self) -> bool {
+        self.timer.elapsed() > self.heartbeat_timeout
     }
 }
 
