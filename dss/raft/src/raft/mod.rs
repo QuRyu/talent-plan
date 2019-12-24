@@ -1,6 +1,7 @@
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration}; 
+use std::thread;
 
 use futures::sync::mpsc::UnboundedSender;
 use rand::Rng;
@@ -78,6 +79,7 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
+    term: u64, 
     voted_for: Option<u64>, 
     leader_id: Option<u64>, 
     role: Role, 
@@ -109,6 +111,7 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
+            term: 0,
             voted_for: None, 
             leader_id: None, 
             role: Default::default(), 
@@ -177,8 +180,9 @@ impl Raft {
     fn send_request_vote(
         &self,
         server: usize,
+        sender: SyncSender<Result<RequestVoteReply>>,
         args: &RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
+    ) {
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
@@ -194,8 +198,10 @@ impl Raft {
         // );
         // rx
         // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        //let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
+        
+
+        crate::your_code_here((server, args, sender))
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -235,6 +241,23 @@ impl Raft {
     fn pass_heartbeat_timeout(&self) -> bool {
         self.timer.elapsed() > self.heartbeat_timeout
     }
+
+    fn is_leader(&self) -> bool {
+        self.leader_id.is_some() && 
+            self.leader_id.unwrap() == self.me as u64 
+    }
+
+    /// reset peer state to become follower 
+    fn become_follower(&mut self, term: u64) { 
+        self.term = term; 
+        self.role = Role::Follower;
+        self.leader_id = None;
+        self.voted_for = None; 
+        
+        self.persist();
+        self.reset_election_timeout();
+        self.reset_timer();
+    }
 }
 
 impl Raft {
@@ -242,12 +265,8 @@ impl Raft {
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.start(&0);
-        let _ = self.send_request_vote(0, &Default::default());
-        self.persist();
         let _ = &self.state;
-        let _ = &self.me;
         let _ = &self.persister;
-        let _ = &self.peers;
     }
 }
 
@@ -267,14 +286,34 @@ impl Raft {
 // ```
 #[derive(Clone)]
 pub struct Node {
-    // Your code here.
+    raft: Arc<Mutex<Raft>>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        // Your code here.
-        crate::your_code_here(raft)
+        let n = Node { 
+            raft: Arc::new(Mutex::new(raft)),
+        };
+
+        // thread handling election 
+        let node = n.clone();
+        thread::Builder::new().spawn(move || {
+            loop {
+                let raft = node.raft.lock().unwrap();
+                if raft.is_leader() && raft.pass_heartbeat_timeout() {
+                    std::mem::drop(raft);
+                    node.replicate(); // trick the node to send empty logs 
+                } else if !raft.is_leader() && raft.pass_election_timeout() {
+                    std::mem::drop(raft);
+                    node.campaign(); // start election 
+                } else {
+                    thread::sleep(5 * MILLIS);
+                }
+            }
+        }).expect("failed to spawn election thread");
+
+        n 
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -293,26 +332,20 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
+        let raft = self.raft.lock().unwrap();
+        raft.start(command)
     }
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
-        crate::your_code_here(())
+        let raft = self.raft.lock().unwrap();
+        raft.term 
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        let raft = self.raft.lock().unwrap();
+        raft.is_leader()
     }
 
     /// The current state of this peer.
@@ -333,6 +366,96 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+    }
+
+    /// Start a new term and request votes from peers 
+    /// if the node believes the primary has died 
+    fn campaign(&self) {
+        let vote_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let mut raft = self.raft.lock().unwrap();
+
+        let (tx, rx) = sync_channel(raft.peers.len()-1);
+        let votes_needed = raft.peers.len()/2;
+        let me = raft.me;
+
+        raft.term += 1; 
+        raft.role = Role::Candidate;
+        raft.leader_id = None;
+        raft.voted_for = Some(raft.me as u64);
+
+        raft.persist();
+
+
+        let args = RequestVoteArgs {
+            term: raft.term, 
+            candidate_id: raft.me as u64, 
+            // TODO: change these two 
+            last_log_index: 1, 
+            last_log_term: 1, 
+        };
+        for i in 0..raft.peers.len() {
+            if i == raft.me {
+                continue; 
+            }
+            
+            let tx = tx.clone();
+            raft.send_request_vote(i, tx, &args);
+        }
+
+        raft.reset_election_timeout();
+        raft.reset_timer();
+
+        let now = raft.timer;
+        let timeout = raft.election_timeout;
+        let current_term = raft.term; 
+        std::mem::drop(raft);
+
+        while now.elapsed() < timeout &&
+          *(vote_count.lock().unwrap()) < votes_needed {
+            if let Ok(resp) = rx.recv() {
+                match resp {
+                    Ok(RequestVoteReply {term, vote_granted}) => {
+                        if vote_granted {
+                            let mut count = vote_count.lock().unwrap();
+                            *count += 1; 
+                        } else {
+                            if term > current_term {
+                                let mut raft = self.raft.lock().unwrap();
+                                raft.become_follower(term);
+                                return;
+                            }
+                        }
+                    }
+
+                    Err(e) => {
+                        error!("server {} campaign error {:?}", me, e);
+                        // resend request vote 
+                        //let tx = tx.clone();
+                        //let raft = self.raft.lock().unwrap();
+                        //raft.send_request_vote(
+                            //server as usize, tx, &args
+                        //);
+                        //std::mem::drop(raft);
+                    }
+                }
+            } 
+        }
+
+        let mut raft = self.raft.lock().unwrap();
+        if *(vote_count.lock().unwrap()) >= votes_needed 
+            && raft.role == Role::Candidate {
+            info!("server {} receives enough votes to become leader", me);
+            raft.role = Role::Leader;
+            raft.leader_id = Some(raft.me as u64);
+
+            // notify that new leader 
+        } 
+        raft.reset_election_timeout();
+        raft.reset_timer();
+    }
+
+    /// Send logs to peers 
+    fn replicate(&self) {
     }
 }
 
