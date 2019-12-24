@@ -1,7 +1,9 @@
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
+use std::time::Instant; 
 
 use futures::sync::mpsc::UnboundedSender;
+
 use labrpc::RpcFuture;
 
 #[cfg(test)]
@@ -39,6 +41,23 @@ impl State {
     }
 }
 
+/// Role of a raft peer. 
+#[derive(PartialEq, Eq, Clone, Debug)]
+enum Role {
+    /// The peer is a follower. 
+    Follower, 
+    /// The peer is a leader. 
+    Leader, 
+    /// The peer might become a leader. 
+    Candidate,
+}
+
+impl Default for Role {
+    fn default() -> Role {
+        Role::Follower
+    }
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -51,6 +70,12 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+
+    voted_for: Option<u64>, 
+    leader_id: Option<u64>, 
+    role: Role, 
+    timer: Instant, 
+
 }
 
 impl Raft {
@@ -76,6 +101,10 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
+            voted_for: None, 
+            leader_id: None, 
+            role: Default::default(), 
+            timer: Instant::now(),
         };
 
         // initialize from state persisted before a crash
