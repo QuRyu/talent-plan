@@ -310,4 +310,8 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         crate::your_code_here(args)
     }
+
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        crate::your_code_here(args)
+    }
 }
