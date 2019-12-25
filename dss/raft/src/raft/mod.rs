@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use futures::future;
 use futures::sync::mpsc::UnboundedSender;
+use futures::Future;
 use rand::Rng;
 
 use labrpc::RpcFuture;
@@ -200,7 +202,38 @@ impl Raft {
         // ```
         //let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
 
-        crate::your_code_here((server, args, sender))
+        let peer = &self.peers[server];
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    match sender.send(res) {
+                        Ok(_) => {}
+                        Err(e) => error!("request vote sender error {:?}", e),
+                    };
+                    Ok(())
+                }),
+        );
+    }
+
+    fn append_log_entries(
+        &self, 
+        server: usize, 
+        sender: SyncSender<Result<AppendEntriesReply>>,
+        args: &AppendEntriesArgs
+    ) {
+        let peer = &self.peers[server];
+        peer.spawn(
+            peer.append_entries(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    match sender.send(res) {
+                        Ok(_) => {}
+                        Err(e) => error!("log entries sender error {:?}", e),
+                    };
+                    Ok(())
+                }),
+        );
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -300,10 +333,20 @@ impl Node {
                     let raft = node.raft.lock().unwrap();
                     if raft.is_leader() && raft.pass_heartbeat_timeout() {
                         std::mem::drop(raft);
-                        node.replicate(); // trick the node to send empty logs
+                        let node = node.clone();
+                        thread::Builder::new()
+                            .spawn(move || {
+                                node.replicate(); // trick the node to send empty logs
+                            })
+                            .expect("fail to spawn replicate thread");
                     } else if !raft.is_leader() && raft.pass_election_timeout() {
                         std::mem::drop(raft);
-                        node.campaign(); // start election
+                        let node = node.clone();
+                        thread::Builder::new()
+                            .spawn(move || {
+                                node.campaign(); // start election
+                            })
+                            .expect("fail to spawn campaign thread");
                     } else {
                         thread::sleep(5 * MILLIS);
                     }
@@ -373,14 +416,15 @@ impl Node {
         let mut raft = self.raft.lock().unwrap();
 
         let (tx, rx) = sync_channel(raft.peers.len() - 1);
-        let votes_needed = raft.peers.len() / 2;
+        let votes_needed = raft.peers.len() / 2 + 1;
         let me = raft.me;
 
         raft.term += 1;
         raft.role = Role::Candidate;
         raft.leader_id = None;
         raft.voted_for = Some(raft.me as u64);
-
+        println!("server {} campaigns for votes, term {}", me, raft.term);
+         
         raft.persist();
 
         let args = RequestVoteArgs {
@@ -407,11 +451,15 @@ impl Node {
         let current_term = raft.term;
         std::mem::drop(raft);
 
-        while now.elapsed() < timeout && vote_count.load(Ordering::SeqCst) < votes_needed {
+        println!("server {} finished sending vote requests, term {}", me, current_term);
+
+        while now.elapsed() < timeout && vote_count.load(Ordering::SeqCst) < votes_needed+1 {
             if let Ok(resp) = rx.recv() {
                 match resp {
                     Ok(RequestVoteReply { term, vote_granted }) => {
+                        println!("server {} received vote reply", me);
                         if vote_granted {
+                            println!("server {} vote_granted", me);
                             vote_count.fetch_add(1, Ordering::SeqCst);
                         } else if term > current_term {
                             let mut raft = self.raft.lock().unwrap();
@@ -436,18 +484,78 @@ impl Node {
 
         let mut raft = self.raft.lock().unwrap();
         if vote_count.load(Ordering::SeqCst) >= votes_needed && raft.role == Role::Candidate {
-            info!("server {} receives enough votes to become leader", me);
+            println!("server {} receives enough votes ({}) to become leader, term {}", me, vote_count.load(Ordering::SeqCst), current_term); // TODO: info
             raft.role = Role::Leader;
             raft.leader_id = Some(raft.me as u64);
 
-            // notify that new leader
+            let node = self.clone();
+            thread::spawn(move || {
+                node.replicate();
+            });
+            // notify that new leader and coordinate entries 
+        } else {
+            println!("server {} campaign failed: vote count {}, term {}", me, vote_count.load(Ordering::SeqCst), current_term);
         }
         raft.reset_election_timeout();
         raft.reset_timer();
     }
 
     /// Send logs to peers
-    fn replicate(&self) {}
+    fn replicate(&self) {
+        // just send empty logs here 
+        let mut raft = self.raft.lock().unwrap();
+        
+        if !raft.is_leader() {
+            return;
+        }
+
+        let me = raft.me; 
+        let (tx, rx) = sync_channel(raft.peers.len()-1);
+
+        // TODO: move this to entries 
+        let args = AppendEntriesArgs {
+            term: raft.term, 
+            leader_id: raft.me as u64,
+        };
+
+        for i in 0..raft.peers.len() {
+            if i == raft.me {
+                continue;
+            }
+
+            let tx = tx.clone();
+            raft.append_log_entries(i, tx, &args);
+        }
+
+        raft.reset_timer();
+        let now = raft.timer;
+        let timeout = raft.heartbeat_timeout;
+        std::mem::drop(raft);
+
+        while now.elapsed() < timeout {
+            if let Ok(resp) = rx.recv() {
+                match resp {
+                    Ok(AppendEntriesReply {term, success}) => {
+                        if success {
+                            // TODO: update log entries 
+                            continue;
+                        } else {
+                            let mut raft = self.raft.lock().unwrap();
+                            if raft.term < term { // become follower 
+                                raft.become_follower(term);
+                                return;
+                            } else { // follower lags behind, send snapshot 
+                            }
+                        }
+                    }
+
+                    Err(e) => error!("server {} append entries error {:?}", me, e),
+                }
+            }
+        }
+
+    }
+
 }
 
 impl RaftService for Node {
@@ -456,10 +564,65 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        // TODO: add conditions on logs later
+        let mut raft = self.raft.lock().unwrap();
+        let me = raft.me;
+        let mut reply = RequestVoteReply {
+            term: raft.term,
+            vote_granted: false,
+        };
+
+        if raft.term == args.term
+            && raft.voted_for.is_some()
+            && raft.voted_for.unwrap() == args.candidate_id as u64
+        {
+            reply.vote_granted = true;
+        } else if raft.term < args.term {
+            // add log condition
+            raft.role = Role::Follower;
+            raft.leader_id = Some(args.candidate_id);
+            raft.term = args.term;
+            raft.voted_for = Some(args.candidate_id);
+            reply.vote_granted = true;
+        }
+
+        raft.reset_timer();
+        std::mem::drop(raft);
+
+        println!(
+            "server {} received vote request from {} for term {}, granted {}",
+            me, args.candidate_id, args.term, reply.vote_granted
+        );
+
+        Box::new(future::ok(reply))
     }
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
-        crate::your_code_here(args)
+        let mut raft = self.raft.lock().unwrap();
+        let mut reply = AppendEntriesReply {
+            term: raft.term, 
+            success: false,
+        };
+
+        if raft.term <= args.term { 
+            reply.success = true; 
+            raft.leader_id = Some(args.leader_id);
+            raft.role = Role::Follower;
+            raft.reset_timer();
+
+            if raft.term < args.term {
+                raft.term = args.term; 
+                raft.voted_for = None; 
+            } 
+
+            // apply logs here 
+            // use apply_ch as well 
+
+            raft.persist();
+            raft.reset_timer();
+        }
+         
+        std::mem::drop(raft);
+        Box::new(future::ok(reply))
     }
 }
