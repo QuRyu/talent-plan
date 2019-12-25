@@ -30,4 +30,5 @@ message AppendEntriesArgs {
 message AppendEntriesReply {
     fixed64 term = 1; 
     bool success = 2; 
+    // fixed64 conflictIndex = 3; // optimization for diverging logs 
 }
