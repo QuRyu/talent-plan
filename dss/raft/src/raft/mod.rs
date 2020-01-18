@@ -209,7 +209,7 @@ impl Raft {
                 .then(move |res| {
                     match sender.send(res) {
                         Ok(_) => {}
-                        Err(e) => error!("server {}: request vote sender error {:?}", me, e),
+                        Err(e) => debug!("server {}: request vote sender error {:?}", me, e),
                     };
                     Ok(())
                 }),
@@ -229,7 +229,7 @@ impl Raft {
                 .then(move |res| {
                     match sender.send(res) {
                         Ok(_) => {}
-                        Err(e) => error!("log entries sender error {:?}", e),
+                        Err(e) => debug!("log entries sender error {:?}", e),
                     };
                     Ok(())
                 }),
@@ -273,7 +273,7 @@ impl Raft {
     }
 
     fn is_leader(&self) -> bool {
-        self.leader_id.is_some() && self.leader_id.unwrap() == self.me as u64
+        self.role == Role::Leader
     }
 
     /// reset peer state to become follower
@@ -335,40 +335,30 @@ impl Node {
                     match raft.role {
                         Role::Follower => {
                             if raft.pass_election_timeout() {
-                                info!(
-                                    "server {}: scheduler thread initiates campaign for term {}",
-                                    raft.me,
-                                    raft.term + 1
-                                );
-                                std::mem::drop(raft);
                                 let node = node.clone();
                                 thread::Builder::new()
                                     .spawn(move || {
                                         node.campaign(); // start election
                                     })
                                     .expect("fail to spawn campaign thread");
-                                thread::sleep(100 * MILLIS);
                             }
                         }
 
                         Role::Leader => {
                             if raft.pass_heartbeat_timeout() {
-                                info!("server {}: scheduler thread initiates replicate", raft.me);
-                                std::mem::drop(raft);
                                 let node = node.clone();
                                 thread::Builder::new()
                                     .spawn(move || {
                                         node.replicate(); // trick the node to send empty logs
                                     })
                                     .expect("fail to spawn replicate thread");
-                                thread::sleep(50 * MILLIS);
                             }
                         }
 
-                        _ => {
-                            thread::sleep(5 * MILLIS);
-                        }
+                        Role::Candidate => {}
                     }
+                    std::mem::drop(raft);
+                    thread::sleep(5 * MILLIS);
                 }
             })
             .expect("failed to spawn election thread");
@@ -410,9 +400,10 @@ impl Node {
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
+        let raft = self.raft.lock().unwrap();
         State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            term: raft.term,
+            is_leader: raft.role == Role::Leader,
         }
     }
 
@@ -425,7 +416,8 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        let raft = self.raft.lock().unwrap();
+        error!("server {} killed", raft.me);
     }
 
     /// Start a new term and request votes from peers
@@ -501,7 +493,7 @@ impl Node {
                     }
 
                     Err(e) => {
-                        error!("server {}: RPC error: {:?}", me, e);
+                        debug!("server {}: RPC error: {:?}", me, e);
                     }
                 }
             }
@@ -529,6 +521,7 @@ impl Node {
                 "server {}: campaign failed, vote count {}, term {}",
                 me, vote_count, current_term
             );
+            raft.role = Role::Follower; // trigger another round of campaign if network partitions
             raft.reset_election_timeout();
             raft.reset_timer();
         }
@@ -589,7 +582,7 @@ impl Node {
                         }
                     }
 
-                    Err(e) => error!("server {}: append entries error {:?}", me, e),
+                    Err(e) => debug!("server {}: append entries error {:?}", me, e),
                 }
             }
         }
@@ -645,7 +638,10 @@ impl RaftService for Node {
             success: false,
         };
 
-        info!("server {} received append_entries and reset timer", raft.me);
+        debug!(
+            "server {}: received append_entries from leader {}",
+            raft.me, args.leader_id
+        );
         raft.reset_timer();
         if raft.term <= args.term {
             reply.success = true;
