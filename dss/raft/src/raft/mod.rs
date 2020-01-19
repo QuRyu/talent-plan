@@ -62,11 +62,11 @@ enum Role {
     Candidate,
 }
 
-struct LogEntry {
-    term: u64, 
-    index: u64, 
-    command: Vec<u8>, 
-}
+//struct LogEntry {
+//term: u64,
+//index: u64,
+//command: Vec<u8>,
+//}
 
 impl Default for Role {
     fn default() -> Role {
@@ -96,11 +96,11 @@ pub struct Raft {
 
     log_entries: Vec<LogEntry>,
     commit_index: u64,
-    last_applied: u64, 
+    last_applied: u64,
     log_index: u64,
-    //last_included_index: u64, 
-    next_index: Vec<u64>, // index of the next log entry to send to each server 
-    match_index: Vec<u64>, // index of highest log entry known to be replicated on server 
+    //last_included_index: u64,
+    next_index: Vec<u64>,  // index of the next log entry to send to each server
+    match_index: Vec<u64>, // index of highest log entry known to be replicated on server
     apply_ch: UnboundedSender<ApplyMsg>,
 }
 
@@ -117,7 +117,7 @@ impl Raft {
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
-        apply_ch: UnboundedSender<ApplyMsg>, 
+        apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
 
@@ -141,7 +141,7 @@ impl Raft {
             log_index: 0,
             next_index: Default::default(),
             match_index: Default::default(),
-            apply_ch
+            apply_ch,
         };
 
         // initialize from state persisted before a crash
@@ -222,30 +222,10 @@ impl Raft {
         );
     }
 
-    fn append_log_entries(
-        &self,
-        server: usize,
-        sender: SyncSender<Result<AppendEntriesReply>>,
-        args: &AppendEntriesArgs,
-    ) {
-        let peer = &self.peers[server];
-        peer.spawn(
-            peer.append_entries(&args)
-                .map_err(Error::Rpc)
-                .then(move |res| {
-                    match sender.send(res) {
-                        Ok(_) => {}
-                        Err(e) => debug!("log entries sender error {:?}", e),
-                    };
-                    Ok(())
-                }),
-        );
-    }
-
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
+    //fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    //where
+        //M: labcodec::Message,
+    //{
         //let index = self.log_index;
         //let term = self.term;
         //let is_leader = self.is_leader();
@@ -254,21 +234,21 @@ impl Raft {
         //// Your code here (2B).
 
         //if is_leader {
-            //let entry = LogEntry { 
-                //term,
-                //index, 
-                //command,
-            //};
+        //let entry = LogEntry {
+        //term,
+        //index,
+        //command,
+        //};
 
-            //self.apply_ch.unbounded_send(entry);
+        //self.apply_ch.unbounded_send(entry);
 
-            //Ok((index, term))
+        //Ok((index, term))
         //} else {
-            //Err(Error::NotLeader)
+        //Err(Error::NotLeader)
         //}
 
-        Ok((0,0))
-    }
+        //Ok((0, 0))
+    //}
 
     fn reset_timer(&mut self) {
         self.timer = Instant::now();
@@ -304,13 +284,18 @@ impl Raft {
         self.reset_timer();
     }
 
+    fn can_commit(&self, index: u64) -> bool {
+        true // TODO: change this!
+    }
+
+    fn apply_logs(&self) {}
 }
 
 impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
+        //let _ = self.start(&0);
         let _ = &self.state;
         let _ = &self.persister;
     }
@@ -402,37 +387,38 @@ impl Node {
         let mut raft = self.raft.lock().unwrap();
 
         let me = raft.me;
-        let index = raft.log_index; 
+        let index = raft.log_index;
         let term = raft.term;
         let is_leader = raft.is_leader();
-        
+
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
 
         if is_leader {
-            //let entry = LogEntry {
-                //term, 
-                //index, 
-                //command: buf,
-            //};
+            let entry = LogEntry {
+                term,
+                index,
+                command: buf,
+            };
 
-            //raft.log_entries.push(entry);
+            raft.log_entries.push(entry);
 
-            //raft.match_index[me] = raft.log_index;
-            //raft.log_index += 1; 
+            raft.match_index[me] = raft.log_index;
+            raft.log_index += 1;
 
-            //std::mem::drop(raft);
+            std::mem::drop(raft);
 
-            //let node = self.clone();
-            //thread::Builder::new().spawn(move || {
-                //node.replicate();
-            //}).expect("Fail to spawn replicate thread");
+            let node = self.clone();
+            thread::Builder::new()
+                .spawn(move || {
+                    node.replicate();
+                })
+                .expect("Fail to spawn replicate thread");
 
             Ok((index, term))
         } else {
             Err(Error::NotLeader)
         }
-
     }
 
     /// The current term of this peer.
@@ -589,49 +575,127 @@ impl Node {
             "server {} replicate entries for term {}",
             raft.me, raft.term
         );
-        let me = raft.me;
-        let (tx, rx) = sync_channel(raft.peers.len() - 1);
-
-        // TODO: move this to entries
-        let args = AppendEntriesArgs {
-            term: raft.term,
-            leader_id: raft.me as u64,
-        };
 
         for i in 0..raft.peers.len() {
             if i == raft.me {
                 continue;
             }
 
-            let tx = tx.clone();
-            raft.append_log_entries(i, tx, &args);
+            //let tx = tx.clone();
+            //raft.append_log_entries(i, tx, &args);
+
+            let node = self.clone();
+            thread::Builder::new()
+                .spawn(move || {
+                    node.append_log_entries(i);
+                })
+                .expect(format!("fail to spawn replicate to server {}", i).as_str());
         }
 
         raft.reset_timer();
-        let now = raft.timer;
-        let timeout = raft.heartbeat_timeout;
+        //let now = raft.timer;
+        //let timeout = raft.heartbeat_timeout;
+        //std::mem::drop(raft);
+
+        //while now.elapsed() < timeout {
+        //if let Ok(resp) = rx.recv() {
+        //match resp {
+        //Ok(AppendEntriesReply { term, success }) => {
+        //if success {
+        //// TODO: update log entries
+        //continue;
+        //} else {
+        //let mut raft = self.raft.lock().unwrap();
+        //if raft.term < term {
+        //// become follower
+        //info!("server {}: current term {} lags behind, become follower for term {}", raft.me, raft.term, term);
+        //raft.become_follower(term);
+        //return;
+        //} else { // follower lags behind, send snapshot
+        //}
+        //}
+        //}
+
+        //Err(e) => debug!("server {}: append entries error {:?}", me, e),
+        //}
+        //}
+        //}
+    }
+
+    fn append_log_entries(&self, server: usize) {
+        let raft = self.raft.lock().unwrap();
+
+        let me = raft.me;
+        let peer = raft.peers[server].clone();
+
+        let prev_log_index = raft.next_index[server] - 1;
+        let prev_log_term = raft.log_entries[prev_log_index as usize].term;
+        let len = raft.log_index - prev_log_index;
+        let mut entries = Vec::with_capacity(len as usize);
+        for i in (prev_log_index + 1) as usize..(raft.log_index + 1) as usize {
+            entries.push(raft.log_entries[i].clone());
+        }
+
+        let args = AppendEntriesArgs {
+            term: raft.term,
+            leader_id: raft.me as u64,
+            prev_log_index,
+            prev_log_term,
+            leader_commit: raft.commit_index,
+            entries,
+        };
+
         std::mem::drop(raft);
 
-        while now.elapsed() < timeout {
-            if let Ok(resp) = rx.recv() {
-                match resp {
-                    Ok(AppendEntriesReply { term, success }) => {
+        let (tx, rx) = sync_channel(1);
+        peer.spawn(
+            peer.append_entries(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    tx.send(res)
+                        .expect("append_log_entries tx should not panic");
+                    Ok(())
+                }),
+        );
+
+        match rx.recv() {
+            Err(_) => {}
+
+            Ok(res) => {
+                match res {
+                    Err(e) => error!("server {}: append_log_entries error, {:?}", me, e),
+
+                    Ok(AppendEntriesReply {
+                        term,
+                        success,
+                        conflict_index,
+                    }) => {
+                        let mut raft = self.raft.lock().unwrap();
                         if success {
-                            // TODO: update log entries
-                            continue;
+                            if prev_log_index + len > raft.next_index[server] {
+                                // in case the reply arrives out of order
+                                raft.next_index[server] = prev_log_index + len;
+                                raft.match_index[server] = prev_log_index + len;
+                            }
+
+                            let commit_index = prev_log_index + len;
+                            if raft.can_commit(commit_index) {
+                                raft.commit_index = commit_index;
+                                raft.persist();
+
+                                raft.apply_logs();
+                            }
                         } else {
-                            let mut raft = self.raft.lock().unwrap();
                             if raft.term < term {
-                                // become follower
-                                info!("server {}: current term {} lags behind, become follower for term {}", raft.me, raft.term, term);
+                                // is no longer the leader
                                 raft.become_follower(term);
-                                return;
-                            } else { // follower lags behind, send snapshot
+                            } else {
+                                // follower is inconsistent
+                                //let conflict_index = conflict_index.unwrap();
+                                raft.next_index[server] = 1.max(raft.log_index.min(conflict_index));
                             }
                         }
                     }
-
-                    Err(e) => debug!("server {}: append entries error {:?}", me, e),
                 }
             }
         }
@@ -686,6 +750,7 @@ impl RaftService for Node {
         let mut reply = AppendEntriesReply {
             term: raft.term,
             success: false,
+            conflict_index: 0, // TODO: update this field
         };
 
         debug!(
