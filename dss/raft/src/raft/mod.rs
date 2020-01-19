@@ -62,6 +62,12 @@ enum Role {
     Candidate,
 }
 
+struct LogEntry {
+    term: u64, 
+    index: u64, 
+    command: Vec<u8>, 
+}
+
 impl Default for Role {
     fn default() -> Role {
         Role::Follower
@@ -87,6 +93,15 @@ pub struct Raft {
     timer: Instant,
     election_timeout: Duration,
     heartbeat_timeout: Duration,
+
+    log_entries: Vec<LogEntry>,
+    commit_index: u64,
+    last_applied: u64, 
+    log_index: u64,
+    //last_included_index: u64, 
+    next_index: Vec<u64>, // index of the next log entry to send to each server 
+    match_index: Vec<u64>, // index of highest log entry known to be replicated on server 
+    apply_ch: UnboundedSender<ApplyMsg>,
 }
 
 impl Raft {
@@ -102,7 +117,7 @@ impl Raft {
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
-        _apply_ch: UnboundedSender<ApplyMsg>, // TODO: unused variable
+        apply_ch: UnboundedSender<ApplyMsg>, 
     ) -> Raft {
         let raft_state = persister.raft_state();
 
@@ -119,6 +134,14 @@ impl Raft {
             timer: Instant::now(),
             election_timeout: MILLIS,
             heartbeat_timeout: HEARTBEAT_TIMEOUT * MILLIS,
+
+            log_entries: Default::default(),
+            commit_index: 0,
+            last_applied: 0,
+            log_index: 0,
+            next_index: Default::default(),
+            match_index: Default::default(),
+            apply_ch
         };
 
         // initialize from state persisted before a crash
@@ -184,23 +207,6 @@ impl Raft {
         sender: SyncSender<Result<RequestVoteReply>>,
         args: &RequestVoteArgs,
     ) {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx
-        // ```
-        //let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-
         let peer = &self.peers[server];
         let me = self.me;
         peer.spawn(
@@ -240,18 +246,28 @@ impl Raft {
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
+        //let index = self.log_index;
+        //let term = self.term;
+        //let is_leader = self.is_leader();
+        //let mut buf = vec![];
+        //labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+        //// Your code here (2B).
 
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
-        }
+        //if is_leader {
+            //let entry = LogEntry { 
+                //term,
+                //index, 
+                //command,
+            //};
+
+            //self.apply_ch.unbounded_send(entry);
+
+            //Ok((index, term))
+        //} else {
+            //Err(Error::NotLeader)
+        //}
+
+        Ok((0,0))
     }
 
     fn reset_timer(&mut self) {
@@ -287,6 +303,7 @@ impl Raft {
         self.reset_election_timeout();
         self.reset_timer();
     }
+
 }
 
 impl Raft {
@@ -382,8 +399,40 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        let raft = self.raft.lock().unwrap();
-        raft.start(command)
+        let mut raft = self.raft.lock().unwrap();
+
+        let me = raft.me;
+        let index = raft.log_index; 
+        let term = raft.term;
+        let is_leader = raft.is_leader();
+        
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+
+        if is_leader {
+            //let entry = LogEntry {
+                //term, 
+                //index, 
+                //command: buf,
+            //};
+
+            //raft.log_entries.push(entry);
+
+            //raft.match_index[me] = raft.log_index;
+            //raft.log_index += 1; 
+
+            //std::mem::drop(raft);
+
+            //let node = self.clone();
+            //thread::Builder::new().spawn(move || {
+                //node.replicate();
+            //}).expect("Fail to spawn replicate thread");
+
+            Ok((index, term))
+        } else {
+            Err(Error::NotLeader)
+        }
+
     }
 
     /// The current term of this peer.
@@ -403,7 +452,7 @@ impl Node {
         let raft = self.raft.lock().unwrap();
         State {
             term: raft.term,
-            is_leader: raft.role == Role::Leader,
+            is_leader: raft.is_leader(),
         }
     }
 
@@ -613,6 +662,7 @@ impl RaftService for Node {
             // TODO: add log check
             raft.role = Role::Follower;
             raft.leader_id = None;
+            raft.voted_for = Some(args.candidate_id);
             raft.term = args.term;
             reply.vote_granted = true;
             reply.term = args.term;
