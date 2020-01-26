@@ -301,7 +301,7 @@ impl Raft {
 
     /// returns last log entry in Raft
     fn last_log_entry(&self) -> &LogEntry {
-        &self.log_entries[self.log_index as usize]
+        &self.log_entries[self.log_index as usize - 1]
     }
 }
 
@@ -405,10 +405,9 @@ impl Node {
         let term = raft.term;
         let is_leader = raft.is_leader();
 
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-
         if is_leader {
+            let mut buf = vec![];
+            labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
             let entry = LogEntry {
                 term,
                 index,
@@ -422,12 +421,14 @@ impl Node {
 
             std::mem::drop(raft);
 
-            let node = self.clone();
-            thread::Builder::new()
-                .spawn(move || {
-                    node.replicate();
-                })
-                .expect("Fail to spawn replicate thread");
+            //let node = self.clone();
+            //thread::Builder::new()
+                //.spawn(move || {
+                    //node.replicate();
+                //})
+                //.expect("Fail to spawn replicate thread");
+
+            info!("Server {}: start to commit entry {:?} at index {}", me, command, index);
 
             Ok((index, term))
         } else {
@@ -491,12 +492,13 @@ impl Node {
 
         raft.persist();
 
+        let last_log = raft.last_log_entry();
         let args = RequestVoteArgs {
             term: raft.term,
             candidate_id: raft.me as u64,
             // TODO: change these two
-            last_log_index: 1,
-            last_log_term: 1,
+            last_log_index: last_log.index,
+            last_log_term: last_log.term,
         };
         for i in 0..raft.peers.len() {
             if i == raft.me {
@@ -559,7 +561,7 @@ impl Node {
 
             raft.role = Role::Leader;
             raft.leader_id = Some(raft.me as u64);
-            raft.next_index = vec![raft.log_index + 1; n];
+            raft.next_index = vec![raft.log_index; n];
             raft.match_index = vec![0; n];
             raft.match_index[me] = raft.log_index;
 
@@ -592,8 +594,8 @@ impl Node {
         }
 
         info!(
-            "server {} replicate entries for term {}",
-            raft.me, raft.term
+            "server {} replicate entries for term {}, log entry length {}",
+            raft.me, raft.term, raft.log_entries.len()
         );
 
         for i in 0..raft.peers.len() {
@@ -624,7 +626,7 @@ impl Node {
         let prev_log_term = raft.log_entries[prev_log_index as usize].term;
 
         let (entries, len) = if raft.log_index > raft.next_index[server] {
-            let entries = raft.make_entries(raft.next_index[server], raft.log_index + 1);
+            let entries = raft.make_entries(raft.next_index[server], raft.log_index);
             let len = entries.len() as u64;
             (entries, len)
         } else {
@@ -675,6 +677,7 @@ impl Node {
 
                             let commit_index = prev_log_index + len;
                             if raft.can_commit(commit_index) {
+                                info!("server {}: commit entries up to {}", raft.me, commit_index);
                                 raft.commit_index = commit_index;
                                 raft.persist();
 
@@ -710,7 +713,7 @@ impl Node {
         let sender = raft.apply_ch.clone();
         let me = raft.me;
 
-        let entries = raft.make_entries(raft.last_applied + 1, raft.log_index + 1);
+        let entries = raft.make_entries(raft.last_applied + 1, raft.log_index);
 
         raft.last_applied = raft.commit_index;
         raft.persist();
@@ -790,6 +793,7 @@ impl RaftService for Node {
     }
 
     fn append_entries(&self, mut args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        let mut apply = false;
         let mut raft = self.raft.lock().unwrap();
         let mut reply = AppendEntriesReply {
             term: raft.term,
@@ -817,16 +821,16 @@ impl RaftService for Node {
                 || raft.log_entries[arg_prev_log_index].term != args.prev_log_term
             {
                 // leader and follower disagree on log entries
-                let mut conflict_index = raft.log_index.min(args.prev_log_index) as usize;
-                let conflict_term = raft.log_entries[conflict_index].term;
+                let mut conflict_index = (raft.log_index - 1).min(args.prev_log_index); 
+                let conflict_term = raft.log_entries[conflict_index as usize].term;
 
-                while raft.log_entries[conflict_index].term == conflict_term {
+                while conflict_index > raft.commit_index && raft.log_entries[conflict_index as usize].term == conflict_term {
                     conflict_index -= 1;
                 }
 
                 reply.conflict_index = conflict_index as u64;
             } else {
-                let drop_index = args.prev_log_index as usize;
+                let drop_index = raft.log_index.min(args.prev_log_index + 1) as usize;
                 raft.log_entries.truncate(drop_index);
                 raft.log_entries.append(&mut args.entries);
 
@@ -835,12 +839,8 @@ impl RaftService for Node {
 
                 if args.leader_commit > raft.commit_index {
                     raft.commit_index = args.leader_commit;
-                    let node = self.clone();
-                    thread::Builder::new()
-                        .spawn(move || {
-                            node.apply_logs();
-                        })
-                        .expect("cannot spawn apply_logs");
+                    apply = true; 
+
                 }
 
                 reply.success = true;
@@ -848,6 +848,14 @@ impl RaftService for Node {
         }
 
         std::mem::drop(raft);
+        if apply {
+                    let node = self.clone();
+                    thread::Builder::new()
+                        .spawn(move || {
+                            node.apply_logs();
+                        })
+                        .expect("cannot spawn apply_logs");
+        }
         Box::new(future::ok(reply))
     }
 }
