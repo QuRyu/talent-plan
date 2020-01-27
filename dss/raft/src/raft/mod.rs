@@ -632,6 +632,7 @@ impl Node {
         } else {
             (vec![], 0)
         };
+        //println!("Server {}: raft leader log index {}, server {}, next_index {}, send entries of length {}", me, raft.log_index, server, raft.next_index[server], entries.len());
 
         let args = AppendEntriesArgs {
             term: raft.term,
@@ -831,10 +832,11 @@ impl RaftService for Node {
                 reply.conflict_index = conflict_index as u64;
             } else {
                 let drop_index = raft.log_index.min(args.prev_log_index + 1) as usize;
+                let args_entries_len = args.entries.len();
                 raft.log_entries.truncate(drop_index);
                 raft.log_entries.append(&mut args.entries);
 
-                raft.log_index = (drop_index + args.entries.len()) as u64;
+                raft.log_index = (drop_index + args_entries_len) as u64;
                 raft.persist();
 
                 if args.leader_commit > raft.commit_index {
@@ -848,14 +850,14 @@ impl RaftService for Node {
         }
 
         std::mem::drop(raft);
-        if apply {
-                    let node = self.clone();
-                    thread::Builder::new()
-                        .spawn(move || {
-                            node.apply_logs();
-                        })
-                        .expect("cannot spawn apply_logs");
-        }
+        //if apply {
+                    //let node = self.clone();
+                    //thread::Builder::new()
+                        //.spawn(move || {
+                            //node.apply_logs();
+                        //})
+                        //.expect("cannot spawn apply_logs");
+        //}
         Box::new(future::ok(reply))
     }
 }
