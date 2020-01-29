@@ -1,4 +1,4 @@
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -332,13 +332,17 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     raft: Arc<Mutex<Raft>>,
+    send_ch: Sender<()>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
+        let (tx, rx) = channel();
+
         let n = Node {
             raft: Arc::new(Mutex::new(raft)),
+            send_ch: tx,
         };
 
         // thread handling election
@@ -378,6 +382,18 @@ impl Node {
                 }
             })
             .expect("failed to spawn election thread");
+
+        let node = n.clone();
+        thread::Builder::new().spawn(move || {
+            loop {
+                match rx.recv() {
+                    Ok(_) => node.apply_logs(),
+                    Err(e) => info!("{:?}", e),
+                }
+            }
+        }).expect("fail to spawn apply_logs thread");
+
+
 
         n
     }
@@ -421,14 +437,7 @@ impl Node {
 
             std::mem::drop(raft);
 
-            //let node = self.clone();
-            //thread::Builder::new()
-                //.spawn(move || {
-                    //node.replicate();
-                //})
-                //.expect("Fail to spawn replicate thread");
-
-            info!("Server {}: start to commit entry {:?} at index {}", me, command, index);
+            info!("Server {} start entry {:?} at index {}", me, command, index);
 
             Ok((index, term))
         } else {
@@ -593,7 +602,7 @@ impl Node {
             return;
         }
 
-        info!(
+        debug!(
             "server {} replicate entries for term {}, log entry length {}",
             raft.me, raft.term, raft.log_entries.len()
         );
@@ -683,12 +692,7 @@ impl Node {
                                 raft.persist();
 
                                 std::mem::drop(raft);
-                                let node = self.clone();
-                                thread::Builder::new()
-                                    .spawn(move || {
-                                        node.apply_logs();
-                                    })
-                                    .expect("Fail to spawn apply_logs");
+                                self.send_ch.send(()).unwrap();
                             }
                         } else if raft.term < term {
                             // is no longer the leader
@@ -713,6 +717,7 @@ impl Node {
         let command_valid = true;
         let sender = raft.apply_ch.clone();
         let me = raft.me;
+        info!("server {}: apply logs of range {}..{},", raft.me, raft.last_applied+1, raft.log_index);
 
         let entries = raft.make_entries(raft.last_applied + 1, raft.log_index);
 
@@ -794,7 +799,6 @@ impl RaftService for Node {
     }
 
     fn append_entries(&self, mut args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
-        let mut apply = false;
         let mut raft = self.raft.lock().unwrap();
         let mut reply = AppendEntriesReply {
             term: raft.term,
@@ -841,23 +845,20 @@ impl RaftService for Node {
 
                 if args.leader_commit > raft.commit_index {
                     raft.commit_index = args.leader_commit;
-                    apply = true; 
+                    self.send_ch.send(()).unwrap();
 
                 }
+                //if raft.log_entries.len() > 1 {
+                    //println!("log entry {:?}", raft.log_entries[1]);
+                //}
+                //println!("Server {}: drop index {}, appending entries of length {}, prev_log_index {}, log_index {}, log entries len {}", raft.me, drop_index, args_entries_len, args.prev_log_index, raft.log_index, raft.log_entries.len());
+
 
                 reply.success = true;
             }
         }
 
         std::mem::drop(raft);
-        //if apply {
-                    //let node = self.clone();
-                    //thread::Builder::new()
-                        //.spawn(move || {
-                            //node.apply_logs();
-                        //})
-                        //.expect("cannot spawn apply_logs");
-        //}
         Box::new(future::ok(reply))
     }
 }
